@@ -23,9 +23,40 @@ git clone <this repo> ~/codeowners-cli
 ln -s ~/codeowners-cli/codeowners /usr/local/bin/codeowners   # or any directory on your PATH
 ```
 
+## Interactive view
+
+Run `codeowners` without arguments for a three-pane terminal view: organizations on the left, owners or repos in the middle, details of the selected entry on the right. It needs no extra packages (Python's built-in `curses`).
+
+```
+ codeowners  ·  all orgs  ·  [Owners] Repos
+ Organizations   │ Owners (3)              │ Details
+▸ All orgs     3 │▸ @acme/platform       2 │ @acme/platform
+  acme         3 │  @acme/backend        2 │ 2 repos in 1 org
+                 │  @alice               1 │ default owner (*) of 1
+                 │                         │
+                 │                         │ acme  (2)
+                 │                         │   api   *
+                 │                         │   web   /src/, *.md
+```
+
+| Key | Action |
+|---|---|
+| `j` `k` / arrows, `PgUp` `PgDn`, `g` `G` | move |
+| `Tab`, `h` `l` / left right, `Enter` | switch pane |
+| `/` | filter by text, `Enter` keeps it, `Esc` clears it |
+| `m` | switch between Owners and Repos view |
+| `u` | Repos view: only repos without a code owner |
+| `a` | show or hide archived repos |
+| `o` | open the selected owner or repo on GitHub in your browser |
+| `r` | reload from GitHub (selected org, or all after a confirmation) |
+| `?` / `q` | help / quit |
+
+Repos without a code owner are shown in yellow. In the Repos view the details list the CODEOWNERS file, all owners and every rule. In the Owners view they list the owner's repos per organization and the patterns the owner covers.
+
 ## Usage
 
 ```
+codeowners                    interactive view (same as `codeowners tui`)
 codeowners orgs               organizations you belong to, with cache state
 codeowners sync               (re)load CODEOWNERS of all organizations into the cache
 codeowners owners             code owners per organization, with repo count

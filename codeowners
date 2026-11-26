@@ -5,6 +5,7 @@ Reads CODEOWNERS files through the `gh` CLI (uses your gh login, no extra token)
 caches the parsed result locally and answers questions from the cache.
 No LLM involved, so no token cost.
 
+  codeowners                    interactive browser (same as `codeowners tui`)
   codeowners orgs               organizations you belong to
   codeowners sync               (re)load CODEOWNERS of all orgs into the cache
   codeowners owners             overview: code owners per organization
@@ -15,12 +16,16 @@ No LLM involved, so no token cost.
 from __future__ import annotations
 
 import argparse
+import curses
 import json
+import locale
 import os
 import re
 import subprocess
 import sys
+import textwrap
 import time
+import webbrowser
 from collections import defaultdict
 from pathlib import Path
 
@@ -262,6 +267,422 @@ def cmd_missing(args, orgs):
     return ok
 
 
+# ---------------------------------------------------------------- terminal UI
+
+HELP = [
+    "Move            j/k or arrows, PgUp/PgDn, g/G",
+    "Switch pane     Tab, h/l or left/right, Enter drills in",
+    "Filter          /  then type, Enter keeps it, Esc clears it",
+    "View            m  toggles Owners / Repos",
+    "Only unowned    u  (Repos view) repos without a code owner",
+    "Archived        a  show or hide archived repos",
+    "Open on GitHub  o  owner page or repo page in the browser",
+    "Reload          r  re-read from GitHub (selected org, or all)",
+    "Quit            q",
+    "",
+    "Yellow rows are repos without a code owner.",
+    "Press any key to close.",
+]
+
+
+def clip(text: str, w: int) -> str:
+    return text if len(text) <= w else text[: max(w - 1, 0)] + "…"
+
+
+def fit(sel: int, top: int, h: int) -> int:
+    """Scroll offset that keeps the selected row inside a window of h rows."""
+    if sel < top:
+        return sel
+    if sel >= top + h:
+        return sel - h + 1
+    return top
+
+
+def owner_url(owner: str) -> str | None:
+    if not owner.startswith("@"):
+        return None  # an email owner has no GitHub page
+    name = owner[1:]
+    if "/" in name:
+        org, team = name.split("/", 1)
+        return f"https://github.com/orgs/{org}/teams/{team}"
+    return f"https://github.com/{name}"
+
+
+def seg(text: str, style: str | None = None) -> list:
+    """One detail-pane line made of a single styled segment."""
+    return [(text, style)]
+
+
+class Tui:
+    """Three panes: organizations | owners or repos | details of the selection."""
+
+    def __init__(self, stdscr, data: dict, orgs: list[str], show_archived: bool):
+        self.s = stdscr
+        self.data = data
+        self.orgs = orgs
+        self.show_archived = show_archived
+        self.mode = "owner"  # "owner" or "repo"
+        self.focus = 1  # 0 orgs, 1 list, 2 details
+        self.filter = ""
+        self.editing = False
+        self.only_unowned = False
+        self.org_sel = self.org_top = self.sel = self.top = self.dtop = 0
+        self.body_h = 10
+        self.detail_key = None
+        self.msg = ""
+        curses.start_color()
+        curses.use_default_colors()
+        for i, color in enumerate((curses.COLOR_CYAN, curses.COLOR_YELLOW, curses.COLOR_GREEN), 1):
+            curses.init_pair(i, color, -1)
+        self.styles = {
+            None: 0,
+            "head": curses.color_pair(1) | curses.A_BOLD,
+            "sub": curses.A_BOLD,
+            "dim": curses.A_DIM,
+            "warn": curses.color_pair(2),
+            "pat": curses.color_pair(3),
+        }
+        self.rebuild()
+
+    # ---- data
+
+    def view_orgs(self) -> list[str]:
+        return self.orgs if self.org_sel == 0 else [self.orgs[self.org_sel - 1]]
+
+    def visible(self, org: str) -> list[tuple]:
+        return [
+            (org, name, repo)
+            for name, repo in sorted(self.data[org]["repos"].items())
+            if self.show_archived or not repo["archived"]
+        ]
+
+    def rebuild(self) -> None:
+        self.org_counts = [len(self.visible(o)) for o in self.orgs]
+        repos = [x for o in self.view_orgs() for x in self.visible(o)]
+        self.owner_map: dict[str, list] = defaultdict(list)
+        for org, name, repo in repos:
+            for owner in owners_of(repo):
+                self.owner_map[owner].append((org, name, repo))
+        needle = self.filter.lower()
+        if self.mode == "owner":
+            ordered = sorted(self.owner_map, key=lambda o: (-len(self.owner_map[o]), o))
+            self.rows = [(o, str(len(self.owner_map[o])), None, o) for o in ordered if needle in o]
+        else:
+            show_org = self.org_sel == 0
+            self.rows = []
+            for org, name, repo in repos:
+                n = len(owners_of(repo))
+                full = f"{org}/{name}"
+                if (self.only_unowned and n) or needle not in full.lower():
+                    continue
+                self.rows.append((full if show_org else name, str(n) if n else "none", None if n else "warn", (org, name)))
+        self.sel = min(self.sel, max(len(self.rows) - 1, 0))
+
+    def current(self):
+        return self.rows[self.sel] if self.rows else None
+
+    # ---- drawing
+
+    def put(self, y: int, x: int, text: str, w: int, attr: int = 0, pad: bool = False) -> None:
+        h, full_w = self.s.getmaxyx()
+        w = min(w, full_w - x)
+        if y < 0 or y >= h or w <= 0:
+            return
+        text = clip(text, w)
+        if pad:
+            text = text.ljust(w)
+        try:
+            self.s.addstr(y, x, text, attr)
+        except curses.error:
+            pass  # curses raises when the last cell of the screen is written, the text is still drawn
+
+    def draw_rows(self, y0: int, x0: int, w: int, h: int, rows: list, sel: int, top: int, focused: bool) -> None:
+        for i in range(h):
+            idx = top + i
+            if idx >= len(rows):
+                break
+            label, right, style = rows[idx][:3]
+            marker = "▸ " if idx == sel else "  "
+            gap = (len(right) + 1) if right else 0
+            text = marker + clip(label, w - 2 - gap).ljust(w - 2 - gap) + (" " + right if right else "")
+            if idx == sel:
+                attr = curses.A_REVERSE | curses.A_BOLD if focused else curses.A_BOLD
+            else:
+                attr = self.styles.get(style, 0)
+            self.put(y0 + i, x0, text, w, attr, pad=True)
+
+    def title(self, x: int, w: int, text: str, focused: bool) -> None:
+        attr = (self.styles["head"] | curses.A_UNDERLINE) if focused else curses.A_DIM
+        self.put(1, x, text, w, attr, pad=True)
+
+    def draw(self) -> None:
+        s = self.s
+        s.erase()
+        H, W = s.getmaxyx()
+        if H < 12 or W < 72:
+            self.put(0, 0, "Terminal too small, need at least 72x12", W)
+            s.refresh()
+            return
+
+        scope = "all orgs" if self.org_sel == 0 else self.orgs[self.org_sel - 1]
+        view = "[Owners] Repos" if self.mode == "owner" else "Owners [Repos]"
+        head = [" codeowners", scope, view]
+        if self.filter or self.editing:
+            head.append(f"filter: {self.filter}{'_' if self.editing else ''}")
+        if self.only_unowned and self.mode == "repo":
+            head.append("only without owner")
+        if self.show_archived:
+            head.append("archived shown")
+        self.put(0, 0, "  ·  ".join(head), W, curses.A_REVERSE | curses.A_BOLD, pad=True)
+
+        lw = min(28, max(18, max(len(o) for o in self.orgs) + 8))
+        rest = W - lw - 2
+        longest = max((len(r[0]) + len(r[1]) + 5 for r in self.rows), default=30)
+        mw = max(24, min(longest, int(rest * 0.55), rest - 30))  # fit the longest name, keep room for details
+        rw = rest - mw
+        mx, dx = lw + 1, lw + 2 + mw
+        bh = H - 3
+        self.body_h = bh
+        for y in range(1, H - 1):
+            self.put(y, lw, "│", 1, curses.A_DIM)
+            self.put(y, mx + mw, "│", 1, curses.A_DIM)
+
+        # organizations
+        self.title(0, lw, " Organizations", self.focus == 0)
+        org_rows = [("All orgs", str(sum(self.org_counts)), None)]
+        org_rows += [(o, str(c), None if c else "dim") for o, c in zip(self.orgs, self.org_counts)]
+        self.org_top = fit(self.org_sel, self.org_top, bh)
+        self.draw_rows(2, 0, lw, bh, org_rows, self.org_sel, self.org_top, self.focus == 0)
+
+        # owners or repos
+        kind = "Owners" if self.mode == "owner" else "Repos"
+        self.title(mx, mw, f" {kind} ({len(self.rows)})", self.focus == 1)
+        self.top = fit(self.sel, self.top, bh)
+        if self.rows:
+            self.draw_rows(2, mx, mw, bh, self.rows, self.sel, self.top, self.focus == 1)
+        else:
+            self.put(2, mx + 2, "nothing matches", mw - 2, curses.A_DIM)
+
+        # details
+        lines = self.detail_lines(rw - 2)
+        key = self.current()[3] if self.rows else None
+        if key != self.detail_key:
+            self.detail_key, self.dtop = key, 0
+        self.dtop = max(0, min(self.dtop, len(lines) - bh))
+        more = f"  ({self.dtop + 1}-{min(self.dtop + bh, len(lines))} of {len(lines)})" if len(lines) > bh else ""
+        self.title(dx, rw, " Details" + more, self.focus == 2)
+        for i in range(bh):
+            if self.dtop + i >= len(lines):
+                break
+            x = dx + 1
+            for text, style in lines[self.dtop + i]:
+                text = clip(text, dx + rw - x)
+                self.put(2 + i, x, text, len(text), self.styles.get(style, 0))
+                x += len(text)
+
+        hint = " Tab pane   j/k move   / filter   m owners⇄repos   u unowned   a archived   o open   r reload   ? help   q quit"
+        self.put(H - 1, 0, self.msg or hint, W, curses.A_REVERSE, pad=True)
+        s.refresh()
+
+    # ---- details
+
+    def detail_lines(self, w: int) -> list:
+        cur = self.current()
+        if not cur:
+            return [seg("Nothing matches the current filter.", "dim")]
+        return self.owner_detail(cur[3], w) if self.mode == "owner" else self.repo_detail(*cur[3], w)
+
+    def owner_detail(self, owner: str, w: int) -> list:
+        repos = self.owner_map[owner]
+        orgs = sorted({o for o, _, _ in repos})
+        lines = [
+            seg(owner, "head"),
+            seg(f"{len(repos)} repos in {len(orgs)} org{'s' if len(orgs) != 1 else ''}", "dim"),
+        ]
+        default = sum(1 for _, _, r in repos if any(x["pattern"] == "*" and owner in x["owners"] for x in r["rules"]))
+        if default:
+            lines.append(seg(f"default owner (*) of {default}", "dim"))
+        for org in orgs:
+            group = [(n, r) for o, n, r in repos if o == org]
+            lines += [[], seg(f"{org}  ({len(group)})", "sub")]
+            nw = min(max(len(n) for n, _ in group), max(12, w // 2))
+            for name, repo in group:
+                patterns = ", ".join(dict.fromkeys(x["pattern"] for x in repo["rules"] if owner in x["owners"]))
+                lines.append([("  " + clip(name, nw).ljust(nw) + "  ", None), (patterns, "pat")])
+        return lines
+
+    def repo_detail(self, org: str, name: str, w: int) -> list:
+        repo = self.data[org]["repos"][name]
+        owners = owners_of(repo)
+        meta = [repo["file"] or "no CODEOWNERS file"] + (["archived"] if repo["archived"] else [])
+        lines = [seg(f"{org}/{name}", "head"), seg(" · ".join(meta), "dim"), []]
+        if not repo["file"]:
+            return lines + [seg("No CODEOWNERS file in this repo.", "warn")]
+        if not owners:
+            return lines + [seg("The CODEOWNERS file names no owner.", "warn")]
+        lines.append(seg(f"Owners ({len(owners)})", "sub"))
+        lines += [seg("  " + part) for part in textwrap.wrap(", ".join(owners), max(w - 2, 10))]
+        lines += [[], seg("Rules", "sub"), seg("  the last matching rule wins on GitHub", "dim")]
+        pw = min(max(len(x["pattern"]) for x in repo["rules"]), max(8, w // 3))
+        for rule in repo["rules"]:
+            parts = textwrap.wrap(" ".join(rule["owners"]), max(w - pw - 4, 10))
+            for i, part in enumerate(parts):
+                label = clip(rule["pattern"], pw).ljust(pw) if i == 0 else " " * pw
+                lines.append([("  ", None), (label, "pat"), ("  " + part, None)])
+        return lines
+
+    # ---- input
+
+    def move(self, delta: int, absolute: bool = False) -> None:
+        if self.focus == 0:
+            target = delta if absolute else self.org_sel + delta
+            self.org_sel = max(0, min(len(self.orgs), target))
+            self.sel = self.top = 0
+            self.rebuild()
+        elif self.focus == 1:
+            target = delta if absolute else self.sel + delta
+            self.sel = max(0, min(len(self.rows) - 1, target))
+        else:
+            self.dtop = max(0, delta if absolute else self.dtop + delta)  # upper bound is clamped when drawing
+
+    def reset_view(self) -> None:
+        self.sel = self.top = 0
+        self.rebuild()
+
+    def open_current(self) -> None:
+        cur = self.current()
+        if not cur:
+            return
+        url = owner_url(cur[3]) if self.mode == "owner" else f"https://github.com/{cur[3][0]}/{cur[3][1]}"
+        if url is None:
+            self.msg = "an email owner has no GitHub page"
+        else:
+            self.msg = f"opened {url}" if webbrowser.open(url) else f"could not start a browser, URL: {url}"
+
+    def confirm(self, question: str) -> bool:
+        H, W = self.s.getmaxyx()
+        self.put(H - 1, 0, " " + question, W, curses.A_REVERSE | curses.A_BOLD, pad=True)
+        self.s.refresh()
+        return self.s.getch() in (ord("y"), ord("Y"))
+
+    def reload(self) -> None:
+        targets = self.view_orgs()
+        if len(targets) > 1 and not self.confirm(f"Reload all {len(targets)} orgs from GitHub? Can take minutes. [y/N]"):
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        new, ok = load(targets, True, True)  # progress and warnings go to the normal terminal
+        self.data.update(new)
+        if not ok:
+            input("Some orgs could not be loaded (see above), the old data stays. Press Enter to go back. ")
+        curses.reset_prog_mode()
+        self.s.clear()
+        self.rebuild()
+        self.msg = f"reloaded {len(new)} of {len(targets)} org(s)"
+
+    def help(self) -> None:
+        H, W = self.s.getmaxyx()
+        bw, bh = min(max(len(x) for x in HELP) + 4, W), min(len(HELP) + 2, H)
+        y0, x0 = (H - bh) // 2, (W - bw) // 2
+        for i in range(bh):
+            self.put(y0 + i, x0, "", bw, curses.A_REVERSE, pad=True)
+        for i, text in enumerate(HELP[: bh - 2]):
+            self.put(y0 + 1 + i, x0 + 2, text, bw - 4, curses.A_REVERSE)
+        self.s.refresh()
+        self.s.getch()
+
+    def handle_edit(self, ch: int) -> None:
+        if ch == 27:
+            self.filter, self.editing = "", False
+        elif ch in (10, 13, curses.KEY_ENTER):
+            self.editing = False
+        elif ch in (8, 127, curses.KEY_BACKSPACE):
+            self.filter = self.filter[:-1]
+        elif 32 <= ch < 127:
+            self.filter += chr(ch)
+        else:
+            return
+        self.reset_view()
+
+    def handle(self, ch: int) -> bool:
+        """Return False to quit."""
+        if self.editing:
+            self.handle_edit(ch)
+            return True
+        page = max(self.body_h - 1, 1)
+        if ch == ord("q"):
+            return False
+        elif ch == 27 and self.filter:
+            self.filter = ""
+            self.reset_view()
+        elif ch == ord("/"):
+            self.editing, self.focus = True, 1
+        elif ch == 9:
+            self.focus = (self.focus + 1) % 3
+        elif ch == curses.KEY_BTAB:
+            self.focus = (self.focus - 1) % 3
+        elif ch in (curses.KEY_RIGHT, ord("l")):
+            self.focus = min(self.focus + 1, 2)
+        elif ch in (curses.KEY_LEFT, ord("h")):
+            self.focus = max(self.focus - 1, 0)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            self.focus = min(self.focus + 1, 2)
+        elif ch in (ord("j"), curses.KEY_DOWN):
+            self.move(1)
+        elif ch in (ord("k"), curses.KEY_UP):
+            self.move(-1)
+        elif ch in (curses.KEY_NPAGE, ord(" "), 4):
+            self.move(page if ch != 4 else page // 2)
+        elif ch in (curses.KEY_PPAGE, 21):
+            self.move(-page if ch != 21 else -(page // 2))
+        elif ch in (ord("g"), curses.KEY_HOME):
+            self.move(0, absolute=True)
+        elif ch in (ord("G"), curses.KEY_END):
+            self.move(10**6, absolute=True)
+        elif ch == ord("m"):
+            self.mode = "repo" if self.mode == "owner" else "owner"
+            self.reset_view()
+        elif ch == ord("u"):
+            if self.mode == "repo":
+                self.only_unowned = not self.only_unowned
+                self.reset_view()
+            else:
+                self.msg = "u works in the Repos view, press m to switch"
+        elif ch == ord("a"):
+            self.show_archived = not self.show_archived
+            self.reset_view()
+        elif ch == ord("o"):
+            self.open_current()
+        elif ch == ord("r"):
+            self.reload()
+        elif ch == ord("?"):
+            self.help()
+        return True
+
+    def run(self) -> None:
+        curses.curs_set(0)
+        self.s.keypad(True)
+        while True:
+            self.draw()
+            ch = self.s.getch()
+            self.msg = ""
+            if ch != curses.KEY_RESIZE and not self.handle(ch):
+                return
+
+
+def cmd_tui(args, orgs):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("error: the interactive view needs a terminal, use the other commands for pipes")
+    data, ok = load(orgs, args.refresh, True)  # archived repos are filtered in the view
+    shown = [o for o in orgs if o in data]
+    if not shown:
+        sys.exit("error: no organization data could be loaded")
+    os.environ.setdefault("ESCDELAY", "25")
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(lambda stdscr: Tui(stdscr, data, shown, args.include_archived).run())
+    return ok
+
+
 def main() -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--org", action="append", metavar="ORG", help="limit to this org (repeatable); default: all your orgs")
@@ -270,7 +691,9 @@ def main() -> int:
     common.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = argparse.ArgumentParser(prog="codeowners", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.set_defaults(fn=cmd_tui, org=None, refresh=False, include_archived=False, json=False)  # no command = interactive view
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("tui", parents=[common], help="interactive browser (default)").set_defaults(fn=cmd_tui)
     sub.add_parser("orgs", parents=[common], help="list your organizations").set_defaults(fn=cmd_orgs)
     sub.add_parser("sync", parents=[common], help="reload CODEOWNERS into the cache").set_defaults(fn=cmd_sync)
     sub.add_parser("owners", parents=[common], help="code owners per organization").set_defaults(fn=cmd_owners)
