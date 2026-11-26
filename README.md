@@ -77,3 +77,7 @@ acme/legacy-tool  (no code owner)
 - If an organization enforces SAML SSO, the token must be authorized for it (`gh auth refresh`, then authorize in the browser). Otherwise the organization can show up with 0 repos.
 - Repos you cannot read are missing from the results without an error.
 - GitHub Enterprise Server is not tested.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
